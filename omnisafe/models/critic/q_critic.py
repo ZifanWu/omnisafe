@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import numpy as np
 
 from omnisafe.models.base import Critic
 from omnisafe.typing import Activation, InitFunction, OmnisafeSpace
@@ -131,3 +132,95 @@ class QCritic(Critic):
             else:
                 res.append(torch.squeeze(critic(torch.cat([obs, act], dim=-1)), -1))
         return res
+
+
+# A more efficient ensemble implementation using torch.bmm()
+def init_weights(m): # important to the initialization of the ensemble in this version of implementation
+    def truncated_normal_init(t, mean=0.0, std=0.01):
+        torch.nn.init.normal_(t, mean=mean, std=std)
+        while True:
+            cond = torch.logical_or(t < mean - 2 * std, t > mean + 2 * std)
+            if not torch.sum(cond):
+                break
+            t = torch.where(cond, torch.nn.init.normal_(torch.ones(t.shape), mean=mean, std=std), t)
+        return t
+
+    if type(m) == nn.Linear or isinstance(m, EnsembleFC):
+        input_dim = m.in_features
+        truncated_normal_init(m.weight, std=1 / (2 * np.sqrt(input_dim)))
+        m.bias.data.fill_(0.0)
+
+class EnsembleFC(nn.Module):
+    __constants__ = ['in_features', 'out_features']
+    in_features: int
+    out_features: int
+    ensemble_size: int
+    weight: torch.Tensor
+
+    def __init__(self, in_features: int, out_features: int, ensemble_size: int, weight_decay: float = 0., bias: bool = True) -> None:
+        super(EnsembleFC, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.ensemble_size = ensemble_size
+        self.weight = nn.Parameter(torch.Tensor(ensemble_size, in_features, out_features))
+        self.weight_decay = weight_decay
+        if bias:
+            self.bias = nn.Parameter(torch.Tensor(ensemble_size, out_features))
+        else:
+            self.register_parameter('bias', None)
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        pass
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        w_times_x = torch.bmm(input, self.weight)
+        return torch.add(w_times_x, self.bias[:, None, :])  # w times x + b
+
+    def extra_repr(self) -> str:
+        return 'in_features={}, out_features={}, bias={}'.format(
+            self.in_features, self.out_features, self.bias is not None
+        )
+
+class QEnsemble(Critic):
+    def __init__(
+        self,
+        obs_space: OmnisafeSpace,
+        act_space: OmnisafeSpace,
+        hidden_sizes: list[int],
+        activation: Activation = 'silu',
+        weight_initialization_mode: InitFunction = 'kaiming_uniform',
+        num_critics: int = 1,
+        use_obs_encoder: bool = False,
+    ) -> None:
+        """Initialize an instance of :class:`QEnsemble`."""
+        super().__init__(
+            obs_space,
+            act_space,
+            hidden_sizes,
+            activation,
+            weight_initialization_mode,
+            num_critics,
+            use_obs_encoder,
+        )
+        self.nn1 = EnsembleFC(obs_space + act_space, hidden_sizes[0], num_critics, weight_decay=0.00003)
+        self.nn2 = EnsembleFC(hidden_sizes[0], hidden_sizes[1], num_critics, weight_decay=0.00006)
+        self.nn3 = EnsembleFC(hidden_sizes[1], 1, num_critics, weight_decay=0.0001)
+        self.activation = nn.SiLU()
+        self.num_critics = num_critics
+        self.apply(init_weights)
+
+    def forward(self, state, action) -> torch.Tensor:
+        xu = torch.cat([state, action], 1)
+        nn1_output = self.activation(self.nn1(xu[None, :, :].repeat([self.num_critics, 1, 1])))
+        nn2_output = self.activation(self.nn2(nn1_output))
+        nn3_output = self.nn3(nn2_output)
+
+        return nn3_output
+
+    def get_decay_loss(self) -> torch.Tensor:
+        decay_loss = 0.
+        for m in self.children():
+            if isinstance(m, EnsembleFC):
+                decay_loss += m.weight_decay * torch.sum(torch.square(m.weight)) / 2.
+        return decay_loss

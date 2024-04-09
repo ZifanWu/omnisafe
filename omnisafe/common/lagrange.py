@@ -134,3 +134,30 @@ class Lagrange:
             0.0,
             self.lagrangian_upper_bound,
         )  # enforce: lambda in [0, inf]
+
+    def update_augmented_lagrange_multiplier(self, violation: float, c: float) -> None:
+        r"""Update Lagrange multiplier (lambda).
+
+        We update the Lagrange multiplier by minimizing the penalty loss, which is defined as:
+
+        .. math::
+
+            \lambda ^{'} = \lambda + \eta \cdot (J_C - J_C^*)
+
+        where :math:`\lambda` is the Lagrange multiplier, :math:`\eta` is the learning rate,
+        :math:`J_C` is the mean episode cost, and :math:`J_C^*` is the cost limit.
+
+        Args:
+            Jc (float): mean episode cost.
+        """
+        self.lambda_optimizer.zero_grad()
+        if self.lagrangian_multiplier > c * violation:
+            lambda_loss = self.lagrangian_multiplier * violation
+        else:
+            lambda_loss = self.lagrangian_multiplier ** 2 / (2 * c)
+        lambda_loss.backward()
+        self.lambda_optimizer.step()
+        self.lagrangian_multiplier.data.clamp_(
+            0.0,
+            self.lagrangian_upper_bound,
+        )  # enforce: lambda in [0, inf]
